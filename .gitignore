@@ -1,0 +1,18 @@
+# Rust build artifacts.
+#
+# Both workspace members build into the single root target/ directory:
+#   - daemon   -> target/release/daemon
+#   - firmware -> target/xtensa-esp32s3-none-elf/release/firmware
+# So one entry at the root covers every build output.
+/target/
+
+# The daemon's virtual-disk backing file (see README "Running the daemon").
+# It is created sparse (10 MiB) at runtime when missing and holds user data,
+# so it must not be committed.
+esb.img
+
+# Editor / IDE noise
+.vscode/
+.idea/
+*.swp
+*.swo

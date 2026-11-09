@@ -1,0 +1,9 @@
+[unstable]
+build-std = ["alloc", "core"]
+
+[build]
+target = "xtensa-esp32s3-none-elf"
+rustflags = ["-C", "force-frame-pointers"]
+
+[env]
+ESP_LOG = "info"

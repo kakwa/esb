@@ -1,0 +1,56 @@
+[package]
+name = "daemon"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+# Async runtime. The BLE stack tasks run on a single-thread runtime (see
+# `#[tokio::main(flavor = "current_thread")]`), matching the trouble-host Linux
+# examples. `signal` powers the SIGUSR1/SIGUSR2 plug/unplug toggle.
+tokio = { version = "1", features = ["macros", "rt", "signal"] }
+# CLI for selecting the HCI device, the backing disk image, and the initial
+# USB-enable state.
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+# Logging via the standard `log` facade; trouble-host's `log` feature routes its
+# internal diagnostics through it.
+log = "0.4"
+env_logger = "0.11"
+
+# BLE host stack (peripheral / GATT server), same git source as the firmware so
+# the two builds share one copy of the crate. `log` enables trouble-host's own
+# diagnostics; everything else (peripheral, central, gatt, derive,
+# default-packet-pool) is in the defaults. `security` enables the BLE pairing /
+# link-layer security state machine so the daemon can participate in LE Secure
+# Connections with the ESP32 (matching the firmware, which enables it too).
+trouble-host = { git = "https://github.com/embassy-rs/trouble.git", features = ["log", "security"] }
+# Crypto backend for trouble-host's `security` feature. `embassy-crypto-rand`
+# auto-registers a std-backed global CSPRNG (needed for pairing nonce / IV
+# generation); `embassy-crypto-rustcrypto` auto-registers the AES-128 (ECB +
+# CMAC) and P-256 ECDH primitives that LE Secure Connections requires. Both are
+# the same git rev the firmware pins, so the whole workspace shares one copy.
+embassy-crypto-rand = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c" }
+embassy-crypto-rustcrypto = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c", features = [
+    "embassy-crypto-aes128-ecb",
+    "embassy-crypto-aes128-cmac",
+    "embassy-crypto-p256-ecdh",
+] }
+# Host-side BLE controller transport over the Linux HCI socket.
+bt-hci = "0.11"
+bt-hci-linux = "0.2"
+libc = "0.2"
+
+# Embassy timing, patched at the workspace root to a git rev that carries the
+# `std` driver (spawns its own alarm thread, so it works alongside tokio).
+embassy-futures = "0.1"
+embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }
+# A `CriticalSectionRawMutex` backed by `std`, required by embassy-sync/time on
+# host targets.
+critical-section = { version = "1", features = ["std"] }
+# The `#[gatt_server]`/`#[gatt_service]` macros emit `static <FIELD>:
+# static_cell::StaticCell<...>` for every characteristic, referencing `static_cell`
+# by absolute path. The macro's own `trouble-host` dependency is not visible to
+# our crate's namespace, so we must depend on `static_cell` directly for the
+# generated code to resolve.
+static_cell = "2"

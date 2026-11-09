@@ -1,0 +1,60 @@
+[package]
+name = "firmware"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+embassy-executor = "0.10.0"
+embassy-futures = "0.1.1"
+embassy-sync = "0.8"
+embassy-time = "0.5"
+embassy-crypto = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c" }
+embassy-crypto-rustcrypto = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c", features = [
+    "embassy-crypto-aes128-ecb",
+    "embassy-crypto-aes128-cmac",
+    "embassy-crypto-p256-ecdh",
+] }
+esp-bootloader-esp-idf = "0.5.0"
+esp-backtrace = { version = "0.19.0", features = ["panic-handler", "println"] }
+esp-hal = { version = "1.1.0", features = ["log-04", "unstable"] }
+esp-alloc = "0.10.0"
+esp-println = { version = "0.17.0", features = ["log-04"] }
+esp-radio = { version = "1.0.0-beta.0", features = ["ble", "log-04", "unstable"] }
+esp-rtos = { version = "0.3.0", features = ["embassy", "esp-alloc", "esp-radio", "log-04"] }
+rand_chacha = { version = "0.3", default-features = false }
+# ESP32 is the GATT *central*: it connects to the Linux daemon (GATT server),
+# polls the `usb_enable` characteristic and pulls 512-byte sector data.
+trouble-host = { git = "https://github.com/embassy-rs/trouble.git", default-features = false, features = [
+    "central",
+    "scan",
+    "gatt",
+    "derive",
+    "security",
+    "log",
+    "default-packet-pool-mtu-255",
+] }
+# USB stack. `embassy-usb` is the high-level device framework (Builder, Config,
+# and the MSC + HID device classes). It is patched at the workspace root to a git
+# rev because the crates.io `0.6.0` release predates the MSC class; the version
+# requirement here is only the semver that the patch must match. Its transitive
+# `embassy-usb-driver` resolves to crates.io 0.2.2 (what esp-hal pulls). `Driver`/
+# `Config` come from esp-hal's re-export at `esp_hal::usb::otg::embassy_usb_device`.
+embassy-usb = { version = "0.6.0", default-features = false }
+# Direct dep for the `Otg` register block: esp-hal does NOT re-export `Otg`
+# (it imports it privately), but we need it to drive the USB soft-disconnect
+# bit (DCTL.SDIS) so we can plug/unplug the composite device over BLE. Pinned to
+# the same 0.4.0 esp-hal already pulls in transitively, so there is exactly one
+# copy of the crate in the build.
+embassy-usb-synopsys-otg = { version = "0.4.0", default-features = false }
+
+[features]
+default = ["esp32s3"]
+esp32s3 = [
+    "esp-hal/esp32s3",
+    "esp-backtrace/esp32s3",
+    "esp-println/esp32s3",
+    "esp-radio/esp32s3",
+    "esp-rtos/esp32s3",
+    "esp-bootloader-esp-idf/esp32s3",
+]

@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = ["firmware", "daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+# Firmware release profile. The daemon inherits these settings, which are
+# acceptable for it as well (panic=abort is fine for a supervising daemon).
+[profile.release]
+opt-level = "z"
+lto = "fat"
+debug = false
+panic = "abort"
+codegen-units = 1
+incremental = false
+
+# The esp-* crates are pinned to a single git rev so that the copies pulled in
+# transitively (esp-rtos -> esp-hal -> ...) are the exact same code as the direct
+# dependencies. [patch] only takes effect at the workspace root.
+#
+# embassy-executor is pinned to the same git rev the proven trouble esp32 example
+# uses, so the executor that esp-rtos links is the known-good one.
+#
+# NOTE: `embassy-usb` (the high-level device framework carrying the MSC and HID
+# *device* classes) is patched to a git rev because the crates.io `0.6.0` release
+# predates the MSC class (it ships only a flat `hid` module, no `class::msc` and no
+# `class::hid::device`). The git rev `0488bf2` still declares version 0.6.0 but is
+# ahead of that release.
+#
+# That git `embassy-usb` declares its sibling deps as `path = "../..."`, so cargo
+# pulls *git* copies of embassy-time / embassy-usb-driver / embassy-time-driver from
+# the same repo. Those would conflict with the *crates.io* copies that esp-hal and
+# this firmware depend on — in particular `embassy-time-driver` carries
+# `links = "embassy-time"`, and two copies of it fail to resolve. To force a single
+# consistent set we also patch those shared crates to the SAME git rev. All of them
+# keep the same version numbers as their crates.io releases (0.5.1 / 0.2.2 / 0.2.2)
+# with only additive API changes, so esp-hal (built against those versions) still
+# compiles. The low-level `embassy-usb-synopsys-otg` driver (source of the `Otg`
+# handle used for USB soft-disconnect) stays on crates.io 0.4.0; its
+# `embassy-usb-driver` dep resolves to the git copy above, so it implements the same
+# `Driver` trait the git `embassy-usb` `Builder` expects.
+[patch.crates-io]
+esp-alloc = { git = "https://github.com/embassy-rs/esp-hal.git", rev = "7af0919e56e8298a7cb429da7f078757e350d842" }
+esp-backtrace = { git = "https://github.com/embassy-rs/esp-hal.git", rev = "7af0919e56e8298a7cb429da7f078757e350d842" }
+esp-bootloader-esp-idf = { git = "https://github.com/embassy-rs/esp-hal.git", rev = "7af0919e56e8298a7cb429da7f078757e350d842" }
+esp-hal = { git = "https://github.com/embassy-rs/esp-hal.git", rev = "7af0919e56e8298a7cb429da7f078757e350d842" }
+esp-println = { git = "https://github.com/embassy-rs/esp-hal.git", rev = "7af0919e56e8298a7cb429da7f078757e350d842" }
+esp-radio = { git = "https://github.com/embassy-rs/esp-hal.git", rev = "7af0919e56e8298a7cb429da7f078757e350d842" }
+esp-rtos = { git = "https://github.com/embassy-rs/esp-hal.git", rev = "7af0919e56e8298a7cb429da7f078757e350d842" }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy.git", rev = "1d3c3de" }
+embassy-usb = { git = "https://github.com/embassy-rs/embassy.git", rev = "0488bf2416b1bbccefedb23845bee711c2ac655d" }
+# Unify the shared embassy crates with git `embassy-usb` (see note above) so there
+# is a single copy of each and the `links = "embassy-time"` conflict is resolved.
+embassy-time = { git = "https://github.com/embassy-rs/embassy.git", rev = "0488bf2416b1bbccefedb23845bee711c2ac655d" }
+embassy-time-driver = { git = "https://github.com/embassy-rs/embassy.git", rev = "0488bf2416b1bbccefedb23845bee711c2ac655d" }
+embassy-usb-driver = { git = "https://github.com/embassy-rs/embassy.git", rev = "0488bf2416b1bbccefedb23845bee711c2ac655d" }
+# `embassy-time`'s `std` feature (used by the daemon's tokio alarm driver) pulls
+# `embassy-time-queue-utils`. The firmware's `esp-rtos` also depends on it (from
+# crates.io). Both copies declare `links = "embassy-time-queue"`, which cargo
+# forbids to coexist, so we unify it into the same git rev as the other embassy
+# crates. It stays version 0.3.x, so `esp-rtos`'s `^0.3` requirement is still met.
+embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy.git", rev = "0488bf2416b1bbccefedb23845bee711c2ac655d" }
