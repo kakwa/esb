@@ -10,6 +10,8 @@
 //! [`LBA`]: crate::protocol::LBA_UUID
 //! [`SECTOR`]: crate::protocol::SECTOR_UUID
 
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_usb::class::msc::device::AsyncBlockDevice;
 use trouble_host::prelude::*;
 
@@ -28,6 +30,12 @@ pub struct BleBlockDevice<'a, 'c, C: Controller> {
     client: &'c GattClient<'a, C, DefaultPacketPool, MAX_SERVICES>,
     lba: Characteristic<u32>,
     sector: Characteristic<[u8; SECTOR_SIZE]>,
+    /// Serializes this read path with any other ATT requester sharing the same
+    /// [`GattClient`] (e.g. the `usb_enable` poll). The client has a single,
+    /// uncorrelated response channel, so two in-flight requests would steal
+    /// each other's responses. The guard is held across one LBA write + sector
+    /// read (not the whole transfer) so the poller can still run between blocks.
+    att_lock: &'c Mutex<NoopRawMutex, ()>,
 }
 
 impl<'a, 'c, C: Controller> BleBlockDevice<'a, 'c, C> {
@@ -35,8 +43,14 @@ impl<'a, 'c, C: Controller> BleBlockDevice<'a, 'c, C> {
         client: &'c GattClient<'a, C, DefaultPacketPool, MAX_SERVICES>,
         lba: Characteristic<u32>,
         sector: Characteristic<[u8; SECTOR_SIZE]>,
+        att_lock: &'c Mutex<NoopRawMutex, ()>,
     ) -> Self {
-        Self { client, lba, sector }
+        Self {
+            client,
+            lba,
+            sector,
+            att_lock,
+        }
     }
 }
 
@@ -56,6 +70,9 @@ impl<C: Controller> AsyncBlockDevice for BleBlockDevice<'_, '_, C> {
         crate::mark_accessed();
         for (offset, chunk) in buf.chunks_exact_mut(SECTOR_SIZE).enumerate() {
             let cur = lba + offset as u32;
+            // Only one ATT request may be in flight at a time; hold the lock
+            // across the write-then-read pair.
+            let _guard = self.att_lock.lock().await;
             // 1. Tell the daemon which LBA to serve.
             self.client
                 .write_characteristic(&self.lba, &cur.to_le_bytes())

@@ -14,6 +14,8 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::{
     Builder,
@@ -225,7 +227,18 @@ async fn main(s: Spawner) {
     // ---- Connect to the daemon (GATT server) and discover the protocol ----
     let target = Address::random(DAEMON_ADDR);
     let connect_config = ConnectConfig {
-        connect_params: Default::default(),
+        // The USB host issues multi-sector reads (e.g. 48 KiB) and usb-storage
+        // gives up after 30 s. At the 80 ms default connection interval each
+        // 512-byte sector costs several round-trips, so such a read would take
+        // longer than the timeout. Request a low-latency link instead.
+        connect_params: RequestedConnParams {
+            min_connection_interval: Duration::from_micros(7_500),
+            max_connection_interval: Duration::from_millis(15),
+            max_latency: 0,
+            min_event_length: Duration::from_secs(0),
+            max_event_length: Duration::from_secs(0),
+            supervision_timeout: Duration::from_secs(8),
+        },
         scan_config: ScanConfig {
             filter_accept_list: &[target],
             ..Default::default()
@@ -242,39 +255,53 @@ async fn main(s: Spawner) {
             .await
             .expect("gatt client");
 
-        let services = client
-            .services_by_uuid(&Uuid::new_long(SERVICE_UUID))
-            .await
-            .expect("find service");
-        let service = services.first().expect("service present").clone();
+        // The GATT client's `task()` must run concurrently with every GATT
+        // request: it forwards incoming ATT responses into the client's
+        // response channel that `services_by_uuid`/`read_characteristic`
+        // await. Starting it only after discovery deadlocks (the daemon's
+        // replies are never delivered and the 30 s ATT timeout fires).
+        let _ = join(client.task(), async {
+            let services = client
+                .services_by_uuid(&Uuid::new_long(SERVICE_UUID))
+                .await
+                .expect("find service");
+            let service = services.first().expect("service present").clone();
 
-        let usb_enable: Characteristic<u8> = client
-            .characteristic_by_uuid(&service, &Uuid::new_long(USB_ENABLE_UUID))
-            .await
-            .expect("usb_enable char");
-        let lba: Characteristic<u32> = client
-            .characteristic_by_uuid(&service, &Uuid::new_long(LBA_UUID))
-            .await
-            .expect("lba char");
-        let sector: Characteristic<[u8; SECTOR_SIZE]> = client
-            .characteristic_by_uuid(&service, &Uuid::new_long(SECTOR_UUID))
-            .await
-            .expect("sector char");
-        esp_println::println!("[esb] discovered ESB service");
+            let usb_enable: Characteristic<u8> = client
+                .characteristic_by_uuid(&service, &Uuid::new_long(USB_ENABLE_UUID))
+                .await
+                .expect("usb_enable char");
+            let lba: Characteristic<u32> = client
+                .characteristic_by_uuid(&service, &Uuid::new_long(LBA_UUID))
+                .await
+                .expect("lba char");
+            let sector: Characteristic<[u8; SECTOR_SIZE]> = client
+                .characteristic_by_uuid(&service, &Uuid::new_long(SECTOR_UUID))
+                .await
+                .expect("sector char");
+            esp_println::println!("[esb] discovered ESB service");
 
-        let mut block_device = BleBlockDevice::new(&client, lba, sector);
-        // Two blocks so MSC can overlap a USB transfer with a BLE pull.
-        let mut block_buf = [0u8; 2 * SECTOR_SIZE];
+            // All ATT requests through this `GattClient` must be serialized: it
+            // has a single, uncorrelated response channel, so the MSC read path
+            // and the `usb_enable` poller would otherwise consume each other's
+            // responses (`UnexpectedGattResponse`).
+            let att_lock = Mutex::new(());
 
-        // Concurrency: GATT task + USB device loop + MSC block loop +
-        // soft-disconnect poll + HID heartbeat.
-        let usb_task = usb.run();
-        let msc_task = msc.run(&mut block_device, &mut block_buf);
-        let sdis_task = soft_disconnect_loop(&client, &usb_enable, otg);
-        let hid_task = hid_heartbeat(&mut hid_writer);
-        let client_task = client.task();
+            let mut block_device =
+                BleBlockDevice::new(&client, lba, sector, &att_lock);
+            // Two blocks so MSC can overlap a USB transfer with a BLE pull.
+            let mut block_buf = [0u8; 2 * SECTOR_SIZE];
 
-        let _ = join(client_task, join(usb_task, join(msc_task, join(sdis_task, hid_task)))).await;
+            // Concurrency: USB device loop + MSC block loop +
+            // soft-disconnect poll + HID heartbeat.
+            let usb_task = usb.run();
+            let msc_task = msc.run(&mut block_device, &mut block_buf);
+            let sdis_task = soft_disconnect_loop(&client, &usb_enable, otg, &att_lock);
+            let hid_task = hid_heartbeat(&mut hid_writer);
+
+            let _ = join(usb_task, join(msc_task, join(sdis_task, hid_task))).await;
+        })
+        .await;
     })
     .await;
 }
@@ -285,14 +312,19 @@ async fn soft_disconnect_loop<'a, 'c, C: Controller>(
     client: &'c GattClient<'a, C, DefaultPacketPool, MAX_SERVICES>,
     usb_enable: &Characteristic<u8>,
     otg: Otg,
+    att_lock: &'c Mutex<NoopRawMutex, ()>,
 ) {
     let mut attached = true; // start attached
     loop {
         let mut val = [0u8; 1];
-        let enabled = match client.read_characteristic(usb_enable, &mut val).await {
-            Ok(n) => n == 1 && val[0] != 0,
-            // On a transient BLE failure keep the last known state.
-            Err(_) => attached,
+        let enabled = {
+            // Serialize with the MSC read path (single response channel).
+            let _guard = att_lock.lock().await;
+            match client.read_characteristic(usb_enable, &mut val).await {
+                Ok(n) => n == 1 && val[0] != 0,
+                // On a transient BLE failure keep the last known state.
+                Err(_) => attached,
+            }
         };
         if enabled != attached {
             attached = enabled;
