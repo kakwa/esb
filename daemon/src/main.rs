@@ -374,10 +374,37 @@ async fn gatt_events_task<P: PacketPool>(
                     }
                     _ => event.accept(),
                 };
-                // Send the reply explicitly so it is not left to Drop.
+                // Send the reply *without blocking* the GATT event loop.
+                //
+                // The outbound L2CAP TX queue is small (8 PDUs, `L2CAP_TX_QUEUE_SIZE`)
+                // and is drained by the BLE runner, which is gated on ACL credits.
+                // Awaiting `reply.send()` here parks this task for as long as the
+                // queue stays full. Normally the runner drains it within a few
+                // connection events. But if the central disconnects *while the
+                // queue is full*, the runner can no longer drain it (the link is
+                // gone), so the `send()` future never completes. The loop is then
+                // parked forever at this `await` and can never reach
+                // `conn.next().await` below to observe `Disconnected` — a deadlock
+                // between "can't see the disconnect" and "the send can't finish
+                // because the connection is already gone". That is the permanent
+                // wedge: the log freezes, no `Disconnected` is logged, and the
+                // process is stuck until killed.
+                //
+                // `try_send()` never blocks: on a full queue it simply drops the
+                // reply. The central's read then times out and it reconnects.
+                // Because this loop is never parked, it always advances to
+                // `conn.next().await` and a disconnect is *always* observed, so
+                // the daemon re-advertises and recovers. We trade a rare,
+                // dropped reply (reconnect churn) for no permanent wedge. This
+                // is the same non-blocking behaviour `Reply::drop` already applies
+                // on the implicit path — just made explicit.
                 match reply {
-                    Ok(reply) => reply.send().await,
-                    Err(e) => warn!("[gatt] error sending response: {:?}", e),
+                    Ok(reply) => {
+                        if let Err(e) = reply.try_send() {
+                            warn!("[gatt] outbound queue full; dropped reply: {:?}", e);
+                        }
+                    }
+                    Err(e) => warn!("[gatt] building response failed: {:?}", e),
                 };
             }
             _ => {} // ignore other Gatt Connection Events
