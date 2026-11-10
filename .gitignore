@@ -7,7 +7,7 @@
 /target/
 
 # The daemon's virtual-disk backing file (see README "Running the daemon").
-# It is created sparse (10 MiB) at runtime when missing and holds user data,
+# It is created sparse (128 MiB) at runtime when missing and holds user data,
 # so it must not be committed.
 esb.img
 

@@ -11,9 +11,10 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
-use embassy_time::Timer;
+use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::{
     Builder,
     Config as UsbConfig,
@@ -39,10 +40,12 @@ use crate::protocol::{
     LBA_UUID, MAX_SERVICES, SECTOR_SIZE, SECTOR_UUID, SERVICE_UUID, USB_ENABLE_UUID,
 };
 use crate::storage::BleBlockDevice;
+use crate::ws2812::Ws2812;
 
 mod csprng;
 mod protocol;
 mod storage;
+mod ws2812;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 use {embassy_crypto_rustcrypto as _, esp_alloc as _, esp_backtrace as _};
@@ -57,8 +60,88 @@ const USB_FS_BASE: usize = 0x6008_0000;
 /// HID usage code for 'A' — used by the periodic heartbeat keystroke.
 const KEY_A: u8 = 0x04;
 
+// ---- Status LED shared state (poll-driven, no locks) ----
+//
+// The LED task (a separate executor task) samples these atomics on a timer and
+// derives the pixel color. Writers just store; the task reads. Three signals:
+//   CONNECTED  – we are paired (a GATT connection to the daemon is up).
+//   ATTACHED   – the USB OTG soft-disconnect bit is cleared (host sees the key).
+//   ACCESS     – latched by the MSC read path, consumed (cleared) by the LED
+//                task; a raw 64-bit timestamp can't live in a static because
+//                this target has no `AtomicU64`.
+static CONNECTED: AtomicBool = AtomicBool::new(false);
+static ATTACHED: AtomicBool = AtomicBool::new(true);
+static ACCESS: AtomicBool = AtomicBool::new(false);
+
+/// Steady-state pixel colors (R, G, B) at a comfortable brightness.
+const LED_ORANGE: (u8, u8, u8) = (200, 96, 0); // unpaired (no daemon connection)
+const LED_BLUE: (u8, u8, u8) = (0, 0, 200); // paired (connected to the daemon)
+const LED_GREEN: (u8, u8, u8) = (0, 180, 0); // plugged (attached to the host)
+const LED_OFF: (u8, u8, u8) = (0, 0, 0);
+
+/// Half-period of the "accessed" green blink (on for this, off for this).
+const LED_BLINK_MS: u64 = 250;
+/// How long after a disk access the green keeps blinking.
+const LED_ACCESS_WINDOW: Duration = Duration::from_millis(1_000);
+
+/// Record that the disk was just read (called from the MSC read path).
+///
+/// Latches a flag the LED task consumes; it does not need to be precise, only
+/// "a read happened since we last looked".
+pub(crate) fn mark_accessed() {
+    ACCESS.store(true, Ordering::Release);
+}
+
+/// Drive the on-board WS2812 from the shared state.
+///
+/// Priority (most to least specific): unpaired → orange; recent disk access →
+/// green blink; attached → green; otherwise (paired, not attached) → blue.
+///
+/// This task owns the (non-`Send`) RMT channel, so it must be spawned with the
+/// plain `Spawner` from [`#[esp_rtos::main]`], never with a `SendSpawner`.
+#[embassy_executor::task]
+async fn led_task(mut led: Ws2812) {
+    let mut on = true;
+    let mut access_until: Option<Instant> = None;
+    loop {
+        // A fresh disk read latches ACCESS; when we see it, extend the window.
+        // `swap` is the atomic consume: we take the flag and clear it in one
+        // step, so a read that lands while we're computing still latches for
+        // the next pass.
+        if ACCESS.swap(false, Ordering::AcqRel) {
+            access_until = Some(Instant::now() + LED_ACCESS_WINDOW);
+        }
+        // `Some` while the window is open, `None` once it has expired.
+        let accessed = match access_until {
+            Some(u) => match u.checked_duration_since(Instant::now()) {
+                Some(_) => true,
+                None => {
+                    access_until = None;
+                    false
+                }
+            },
+            None => false,
+        };
+
+        let connected = CONNECTED.load(Ordering::Acquire);
+        let attached = ATTACHED.load(Ordering::Acquire);
+        let (r, g, b) = if !connected {
+            LED_ORANGE
+        } else if accessed {
+            if on { LED_GREEN } else { LED_OFF }
+        } else if attached {
+            LED_GREEN
+        } else {
+            LED_BLUE
+        };
+        let _ = led.set_rgb(r, g, b).await;
+        Timer::after_millis(LED_BLINK_MS).await;
+        on = !on;
+    }
+}
+
 #[esp_rtos::main]
-async fn main(_s: Spawner) {
+async fn main(s: Spawner) {
     esp_println::logger::init_logger_from_env();
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
 
@@ -132,6 +215,13 @@ async fn main(_s: Spawner) {
     // Soft-disconnect register handle (DCTL.SDIS).
     let otg = unsafe { Otg::from_ptr(USB_FS_BASE as *mut ()) };
 
+    // ---- Status LED (on-board WS2812 on GPIO48, driven over RMT ch 0) ----
+    // The channel is non-`Send`, so the `Ws2812` handle must move into a task
+    // spawned on the plain (non-`Send`) `Spawner`, not held in `main`.
+    let led = Ws2812::new(peripherals.RMT, peripherals.GPIO48)
+        .expect("init RMT for status LED");
+    s.spawn(led_task(led).expect("spawn status LED task"));
+
     // ---- Connect to the daemon (GATT server) and discover the protocol ----
     let target = Address::random(DAEMON_ADDR);
     let connect_config = ConnectConfig {
@@ -146,6 +236,7 @@ async fn main(_s: Spawner) {
         esp_println::println!("[esb] scanning for daemon...");
         let conn = central.connect(&connect_config).await.expect("connect to daemon");
         esp_println::println!("[esb] connected");
+        CONNECTED.store(true, Ordering::Release);
 
         let client = GattClient::<_, DefaultPacketPool, MAX_SERVICES>::new(&stack, &conn)
             .await
@@ -205,6 +296,7 @@ async fn soft_disconnect_loop<'a, 'c, C: Controller>(
         };
         if enabled != attached {
             attached = enabled;
+            ATTACHED.store(attached, Ordering::Release);
             let sdis = !enabled;
             otg.dctl().modify(|r| r.set_sdis(sdis));
             esp_println::println!("[esb] USB {} to host", if sdis { "unplugged" } else { "attached" });

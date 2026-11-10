@@ -40,14 +40,16 @@ and then:
 3. **HID heartbeat.** Every 10 s the keyboard emits a press/release of the
    `A` key, so the host can see the device is alive.
 
-**Plug/unplug is driven at runtime by signals to the daemon:**
+**Plug/unplug is driven at runtime by signals or the control IPC:**
 
 | Signal    | Effect                         |
 |-----------|--------------------------------|
 | `SIGUSR1` | USB attached  (`usb_enable=1`) |
 | `SIGUSR2` | USB detached  (`usb_enable=0`) |
 
-The initial state is set with `--no-usb` (start detached).
+The initial state is set with `--no-usb` (start detached). The same operations,
+plus userland FAT32 inspection/copying, are available through the daemon's
+Unix-domain IPC socket (see [Control IPC](#control-ipc) below).
 
 ## Repository layout
 
@@ -61,7 +63,10 @@ firmware/         ESP32-S3 firmware (no_std, pure Rust, no ESP-IDF)
 daemon/           Linux daemon (std, tokio)
   src/main.rs     GATT server, advertisement, event dispatch, signal toggles, CLI
   src/protocol.rs shared GATT UUIDs / addresses / constants
-  src/disk.rs     file-backed sector store (File::read_at, zero-filled tail)
+  src/disk.rs     file-backed sector store (positional I/O, zero-filled tail)
+  src/fat.rs      userland FAT32 format/list/copy (fatfs, no kernel mount)
+  src/control.rs  Unix-domain IPC server for attach/detach/image operations
+  src/ipc.rs      newline-delimited JSON control protocol + CLI client
 ```
 
 ## GATT protocol
@@ -77,7 +82,9 @@ byte-identical** — that is the whole contract between the two sides.
 | `sector`       | `0x84`      | read    | 512 bytes        | contents of the last-written LBA           |
 
 - Service UUID: `…a1:90:81` (full value in `protocol.rs` on both sides).
-- Disk geometry: 512-byte sectors, 20 480 sectors = **10 MiB** virtual disk.
+- Disk geometry: 512-byte sectors, 262 144 sectors = **128 MiB** virtual disk.
+  The size is a compile-time constant shared by both sides; `init` defaults to a
+  128 MiB FAT32 image.
 - Daemon address (advertised random, whitelisted by the firmware):
   `0E:C3:B2:A1:90:81` (`DAEMON_ADDR = [0x81,0x90,0xa1,0xb2,0xc3,0x0e]`,
   byte array is LSB-first, so the display order is the reverse).
@@ -166,28 +173,66 @@ espflash handles entering download mode (auto-reset), then writes **bootloader
 
 ## Running the daemon
 
+Create a fresh FAT32 image first (in userland — nothing is kernel-mounted):
+
+```sh
+# Default: 128 MiB, refuses to overwrite an existing file (add --force).
+./target/release/daemon init esb.img
+
+# Smaller image (FAT32 needs at least 64 MiB) or explicit path:
+./target/release/daemon init --image disk.img --size-mib 64
+```
+
+The image cannot exceed the 128 MiB virtual disk size compiled into both the
+daemon and firmware; a larger FAT volume would not be fully visible over MSC.
+
+Then start the daemon. With no subcommand it runs the BLE server (the existing
+invocation keeps working):
+
 ```sh
 # BlueZ must be running and the HCI device must be up (usually needs root or
 # CAP_NET_ADMIN, e.g. `sudo hci0 up` / `hciconfig hci0 up`).
 ./target/release/daemon \
     --device 0 \          # HCI device number (default 0)
-    --image esb.img \     # backing file; created sparse (10 MiB) if missing
+    --image esb.img \     # backing file; created sparse (128 MiB) if missing
     --no-usb              # optional: start in the detached (unplugged) state
 ```
 
-Then toggle plug/unplug at runtime:
+Toggle plug/unplug at runtime either with signals or IPC:
 
 ```sh
-kill -USR1 <daemon-pid>   # attach  -> host sees the device appear
-kill -USR2 <daemon-pid>   # detach  -> host sees the device vanish
+kill -USR1 <daemon-pid>          # attach -> host sees the device appear
+kill -USR2 <daemon-pid>          # detach -> host sees the device vanish
+
+./target/release/daemon attach   # same, via the control socket
+./target/release/daemon detach
+./target/release/daemon status
 ```
 
-To put content on the virtual disk, just write to the backing file before or
-while running (reads past EOF come back as zeros, like a sparse disk):
+## Control IPC
+
+The daemon listens on a Unix-domain socket (`$XDG_RUNTIME_DIR/esb-daemon.sock`,
+or `/tmp/esb-daemon-<uid>.sock` when no runtime dir is set; override with
+`--socket PATH`). The CLI speaks newline-delimited JSON to it, so scripts can
+use the same operations. All image access happens in the daemon process, in
+userland, via `fatfs`; the image is never mounted by the kernel.
 
 ```sh
-dd if=/dev/urandom of=esb.img bs=512 count=4   # fill the first 2 KiB
+# Explore the FAT32 image (only FAT32 is accepted).
+./target/release/daemon ls /
+./target/release/daemon ls /some/dir
+
+# Copy a file out of the image, or into it.
+./target/release/daemon get /docs/notes.txt ./notes.txt
+./target/release/daemon put ./photo.jpg /photos/photo.jpg
+
+# USB state, image size and FAT32 free space.
+./target/release/daemon status
 ```
+
+The control socket is created with mode `0600`; a stale socket left by a
+previous daemon is replaced automatically, but any existing non-socket file at
+that path is left untouched (the daemon refuses to start).
 
 ## Security
 
@@ -207,6 +252,8 @@ on later without changing the protocol.
   could not be brought up without root in the bring-up environment, so the
   daemon↔ESP32 connection, sector streaming, and soft-disconnect toggle still
   need a first live run on a host with a working, upped HCI radio.
-- The virtual disk is **read-only** (the MSC read path only); writes are not
-  implemented.
+- The virtual disk is **read-only to the USB host** (the MSC read path only);
+  USB-initiated writes are not implemented. The image can be modified through
+  the daemon's IPC (`put`) while it runs.
 - Single connection, single service — sized for exactly the ESP32↔daemon link.
+- The image size is a compile-time constant shared by both sides (128 MiB).

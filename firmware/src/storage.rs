@@ -52,6 +52,8 @@ impl<C: Controller> AsyncBlockDevice for BleBlockDevice<'_, '_, C> {
     }
 
     async fn read_blocks(&mut self, lba: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
+        // Flag a disk access so the status LED blinks green (host read the disk).
+        crate::mark_accessed();
         for (offset, chunk) in buf.chunks_exact_mut(SECTOR_SIZE).enumerate() {
             let cur = lba + offset as u32;
             // 1. Tell the daemon which LBA to serve.

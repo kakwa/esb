@@ -46,8 +46,10 @@ pub const SECTOR_SIZE: usize = 512;
 /// match `DAEMON_ADDR` on the firmware side.
 pub const DAEMON_ADDR: [u8; 6] = [0x81, 0x90, 0xa1, 0xb2, 0xc3, 0x0e];
 
-/// Total number of logical blocks the daemon exposes (10 MiB of 512-byte blocks).
-pub const BLOCK_COUNT: u32 = (10 * 1024 * 1024 / SECTOR_SIZE) as u32;
+/// Total number of logical blocks the daemon exposes (128 MiB of 512-byte
+/// blocks). This must match `firmware/src/protocol.rs`: the firmware reports it
+/// as the MSC capacity, while the daemon is authoritative for the data.
+pub const BLOCK_COUNT: u32 = (128 * 1024 * 1024 / SECTOR_SIZE) as u32;
 
 /// Server-side protocol state shared between the GATT read handlers and the
 /// control loop.

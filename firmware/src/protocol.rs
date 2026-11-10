@@ -42,8 +42,9 @@ pub const SECTOR_SIZE: usize = 512;
 /// Total number of logical blocks exposed to the USB host as the virtual disk.
 ///
 /// The daemon is authoritative for the real size; this is the value the
-/// firmware reports in the MSC capacity (10 MiB = 20480 blocks of 512 bytes).
-pub const BLOCK_COUNT: u32 = 10 * 1024 * 1024 / SECTOR_SIZE as u32;
+/// firmware reports in the MSC capacity (128 MiB = 262144 blocks of 512 bytes).
+/// Keep this in sync with `daemon/src/protocol.rs`.
+pub const BLOCK_COUNT: u32 = 128 * 1024 * 1024 / SECTOR_SIZE as u32;
 
 /// Max number of GATT services the client keeps. The trouble-host `GattClient`
 /// is const-generic over this with no default, so it must be named explicitly.

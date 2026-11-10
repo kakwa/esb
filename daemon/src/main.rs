@@ -10,14 +10,21 @@
 //! the (synchronous) GATT read handler, so they are blocking `File::read_at`
 //! calls — fine for 512-byte sectors.
 //!
-//! Plug/unplug is driven at runtime by signals:
+//! Plug/unplug is driven at runtime by signals or the control IPC:
 //!
 //! - `SIGUSR1` -> USB attached  (`usb_enable = 1`)
 //! - `SIGUSR2` -> USB detached   (`usb_enable = 0`)
 //!
 //! The initial state is set with `--no-usb`.
+//!
+//! A Unix-domain control socket (see [`control`]) lets the bundled CLI attach /
+//! detach the device and list or copy files in the FAT32 image while the daemon
+//! runs. All filesystem access is in userland; nothing is kernel-mounted.
 
+mod control;
 mod disk;
+mod fat;
+mod ipc;
 mod protocol;
 
 // Register trouble-host's `security` crypto backend: a std-backed global CSPRNG
@@ -30,14 +37,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use embassy_futures::join::join;
 use log::{info, warn};
 use trouble_host::prelude::*;
 
 use crate::disk::Disk;
+use crate::ipc::Request;
 use crate::protocol::{
-    DAEMON_ADDR, LBA_UUID, ProtocolState, SECTOR_SIZE, SECTOR_UUID, SERVICE_UUID, USB_ENABLE_UUID,
+    ProtocolState, DAEMON_ADDR, LBA_UUID, SECTOR_SIZE, SECTOR_UUID, SERVICE_UUID, USB_ENABLE_UUID,
 };
 
 /// Max number of connections. Only the ESP32-S3 connects.
@@ -82,20 +90,74 @@ struct EsbService {
 // CLI
 // ---------------------------------------------------------------------------
 
+/// Default backing-image filename.
+const DEFAULT_IMAGE: &str = "esb.img";
+/// Default `init` size in MiB (large enough for FAT32).
+const DEFAULT_IMAGE_SIZE_MIB: u64 = 128;
+
 #[derive(Parser, Debug)]
-#[command(name = "esb-daemon", about = "ESB BLE GATT server hosting a virtual USB disk for an ESP32-S3")]
+#[command(
+    name = "esb-daemon",
+    about = "ESB BLE GATT server hosting a virtual USB disk for an ESP32-S3"
+)]
 struct Args {
     /// HCI device number to bind to (`0` for the default adapter).
-    #[arg(long, default_value_t = 0, value_name = "DEV")]
+    #[arg(long, default_value_t = 0, value_name = "DEV", global = true)]
     device: u16,
 
-    /// Backing disk image file. Created sparse if it does not exist.
-    #[arg(long, default_value = "esb.img", value_name = "PATH")]
+    /// Backing disk image file. Created sparse (128 MiB) if it does not exist.
+    #[arg(long, default_value = DEFAULT_IMAGE, value_name = "PATH", global = true)]
     image: PathBuf,
 
+    /// Control IPC socket path. Defaults to `$XDG_RUNTIME_DIR/esb-daemon.sock`
+    /// or a per-UID path under the system temp directory.
+    #[arg(long, value_name = "PATH", global = true)]
+    socket: Option<PathBuf>,
+
     /// Start with the USB device soft-disconnected (the host sees it unplugged).
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_usb: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the BLE daemon (the default when no subcommand is given).
+    Serve,
+    /// Create a fresh FAT32 image in userland (no kernel mount).
+    Init {
+        /// Image file to initialize (defaults to `--image`).
+        path: Option<PathBuf>,
+        /// Image size in MiB (must be at least 64 MiB for FAT32).
+        #[arg(long, default_value_t = DEFAULT_IMAGE_SIZE_MIB, value_name = "MIB")]
+        size_mib: u64,
+        /// Overwrite the file if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Attach (plug in) the virtual USB device.
+    Attach,
+    /// Detach (unplug) the virtual USB device.
+    Detach,
+    /// Show USB state and image/filesystem summary.
+    Status,
+    /// List a directory inside the FAT32 image.
+    Ls {
+        #[arg(default_value = "/", value_name = "PATH")]
+        path: String,
+    },
+    /// Copy a file out of the image: `get <IMAGE_PATH> <HOST_PATH>`.
+    Get {
+        image_path: String,
+        host_path: PathBuf,
+    },
+    /// Copy a file into the image: `put <HOST_PATH> <IMAGE_PATH>`.
+    Put {
+        host_path: PathBuf,
+        image_path: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -105,31 +167,92 @@ struct Args {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     env_logger::init();
-    let args = Args::parse();
+    let Args {
+        device,
+        image,
+        socket,
+        no_usb,
+        command,
+    } = Args::parse();
+    let socket = socket.unwrap_or_else(ipc::default_socket_path);
 
-    let disk = Disk::open_or_create(&args.image)
-        .with_context(|| format!("opening backing image {:?}", args.image))?;
-    info!(
-        "backing image {:?} ready ({} bytes per sector, {} sectors)",
-        args.image,
-        SECTOR_SIZE,
-        crate::protocol::BLOCK_COUNT
-    );
+    match command.unwrap_or(Command::Serve) {
+        Command::Init {
+            path,
+            size_mib,
+            force,
+        } => {
+            let target = path.unwrap_or(image);
+            let size = size_mib
+                .checked_mul(1024 * 1024)
+                .context("image size is too large")?;
+            let info = fat::init(&target, size, force)?;
+            println!(
+                "initialized FAT32 image {} ({} bytes, cluster {}, {} free)",
+                target.display(),
+                size,
+                info.cluster_size,
+                info.free_bytes
+            );
+        }
+        Command::Attach => ipc::print_response(ipc::request(&socket, &Request::Attach)?)?,
+        Command::Detach => ipc::print_response(ipc::request(&socket, &Request::Detach)?)?,
+        Command::Status => ipc::print_response(ipc::request(&socket, &Request::Status)?)?,
+        Command::Ls { path } => ipc::print_response(ipc::request(&socket, &Request::Ls { path })?)?,
+        Command::Get {
+            image_path,
+            host_path,
+        } => ipc::print_response(ipc::request(
+            &socket,
+            &Request::Get {
+                image_path,
+                host_path,
+            },
+        )?)?,
+        Command::Put {
+            host_path,
+            image_path,
+        } => ipc::print_response(ipc::request(
+            &socket,
+            &Request::Put {
+                host_path,
+                image_path,
+            },
+        )?)?,
+        Command::Serve => {
+            let disk = Disk::open_or_create(&image)
+                .with_context(|| format!("opening backing image {image:?}"))?;
+            info!(
+                "backing image {:?} ready ({} bytes per sector, {} sectors, {} bytes)",
+                image,
+                SECTOR_SIZE,
+                crate::protocol::BLOCK_COUNT,
+                disk.size()
+            );
 
-    let state = ProtocolState::new();
-    if args.no_usb {
-        state.set_usb_enable(false);
+            let state = ProtocolState::new();
+            if no_usb {
+                state.set_usb_enable(false);
+            }
+            // Share the control state with the GATT event task (reads/writes),
+            // the signal task and the IPC server (plug/unplug toggles) via `Arc`.
+            let state = Arc::new(state);
+
+            control::spawn(&socket, image, Arc::clone(&state), disk.clone())
+                .with_context(|| format!("starting control IPC on {socket:?}"))?;
+
+            let transport = bt_hci_linux::Transport::new(device)
+                .with_context(|| format!("opening HCI device {device}"))?;
+            let controller = ExternalController::<_, 8>::new(transport);
+
+            info!(
+                "HCI device {} ready; advertising as {:?}",
+                device, DAEMON_ADDR
+            );
+            run(controller, state, disk).await?;
+        }
     }
-    // Share the control state with the GATT event task (reads/writes) and the
-    // signal task (plug/unplug toggles) via `Arc`.
-    let state = Arc::new(state);
-
-    let transport = bt_hci_linux::Transport::new(args.device)
-        .with_context(|| format!("opening HCI device {}", args.device))?;
-    let controller = ExternalController::<_, 8>::new(transport);
-
-    info!("HCI device {} ready; advertising as {:?}", args.device, DAEMON_ADDR);
-    run(controller, state, disk).await
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +341,10 @@ async fn gatt_events_task<P: PacketPool>(
                             let lba = state.lba();
                             let mut buf = [0u8; SECTOR_SIZE];
                             if let Err(e) = disk.read_sector(lba, &mut buf) {
-                                warn!("[gatt] sector read @ {} failed: {:?} (serving zeros)", lba, e);
+                                warn!(
+                                    "[gatt] sector read @ {} failed: {:?} (serving zeros)",
+                                    lba, e
+                                );
                             }
                             event.accept_unprocessed(&buf)
                         } else {
@@ -231,7 +357,9 @@ async fn gatt_events_task<P: PacketPool>(
                                 Ok(()) => {
                                     event.with_data(|offset, data| {
                                         if offset == 0 && data.len() == 4 {
-                                            let lba = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                                            let lba = u32::from_le_bytes([
+                                                data[0], data[1], data[2], data[3],
+                                            ]);
                                             state.set_lba(lba);
                                             info!("[gatt] LBA set to {}", lba);
                                         }
@@ -301,7 +429,10 @@ async fn signal_toggle_task(state: Arc<ProtocolState>) {
         .expect("install SIGUSR1 handler");
     let mut usr2 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
         .expect("install SIGUSR2 handler");
-    info!("[signal] SIGUSR1=attach, SIGUSR2=detach (current usb_enable={})", state.usb_enable());
+    info!(
+        "[signal] SIGUSR1=attach, SIGUSR2=detach (current usb_enable={})",
+        state.usb_enable()
+    );
     loop {
         tokio::select! {
             _ = usr1.recv() => {
